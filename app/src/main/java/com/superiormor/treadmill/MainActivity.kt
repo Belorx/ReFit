@@ -33,6 +33,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.PermissionController
 import androidx.health.connect.client.permission.HealthPermission
@@ -42,11 +43,13 @@ import androidx.health.connect.client.records.TotalCaloriesBurnedRecord
 import androidx.health.connect.client.units.Energy
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
+import java.io.File
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.time.Instant
 import java.time.ZoneOffset
 import java.util.*
@@ -54,18 +57,17 @@ import kotlin.math.max
 import kotlin.math.min
 
 // ==========================================
-// 1. КОНСТАНТЫ BLE (FTMS + Китайские чипы)
+// 1. КОНСТАНТЫ И ПРОТОКОЛЫ BLE
 // ==========================================
 object BleUuids {
-    // Стандартный FTMS (Fitness Machine Service)
     val FTMS_SERVICE: UUID = UUID.fromString("00001826-0000-1000-8000-00805f9b34fb")
-    val TREADMILL_DATA: UUID = UUID.fromString("00002acd-0000-1000-8000-00805f9b34fb") // Notify (телеметрия)
-    val CONTROL_POINT: UUID = UUID.fromString("00002ad9-0000-1000-8000-00805f9b34fb")  // Write (команды)
+    val TREADMILL_DATA: UUID = UUID.fromString("00002acd-0000-1000-8000-00805f9b34fb")
+    val CONTROL_POINT: UUID = UUID.fromString("00002ad9-0000-1000-8000-00805f9b34fb")
     val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-    // Китайские кастомные чипы (FitShow, Spax, FS, hnk_sports и др.)
-    val CUSTOM_SERVICE_FFE0: UUID = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb")
+    // Кастомный сервис дорожки hnk_sports (0xFFF0)
     val CUSTOM_SERVICE_FFF0: UUID = UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb")
+    val CUSTOM_SERVICE_FFE0: UUID = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb")
 }
 
 data class DiscoveredDevice(
@@ -80,6 +82,7 @@ data class WorkoutState(
     val isConnected: Boolean = false,
     val isScanning: Boolean = false,
     val connectedDeviceName: String = "",
+    val isRunning: Boolean = false,
     val statusText: String = "Нажмите «Поиск BLE», чтобы найти hnk_sports",
     val currentSpeedKmh: Float = 0.0f,
     val elapsedSeconds: Int = 0,
@@ -87,12 +90,16 @@ data class WorkoutState(
     val caloriesKcal: Int = 0,
     val estimatedSteps: Int = 0,
     val rawBytesLog: String = "",
+    val txBytesLog: String = "",
     val servicesDump: String = "",
+    val updateStatus: String = "",
+    val isUpdating: Boolean = false,
+    val updateProgress: Float = 0f,
     val discoveredDevices: List<DiscoveredDevice> = emptyList()
 )
 
 // ==========================================
-// 2. VIEWMODEL: БИЗНЕС-ЛОГИКА, BLE И HEALTH
+// 2. VIEWMODEL: BLE, УПРАВЛЕНИЕ И ОБНОВЛЕНИЯ
 // ==========================================
 @SuppressLint("MissingPermission")
 class TreadmillViewModel : ViewModel() {
@@ -105,6 +112,7 @@ class TreadmillViewModel : ViewModel() {
     private var bleScanner: BluetoothLeScanner? = null
     private var scanCallback: ScanCallback? = null
     private var scanTimeoutJob: Job? = null
+    private var isFaEfProtocol: Boolean = true
 
     private fun isTargetDevice(name: String): Boolean {
         val n = name.lowercase(Locale.ROOT)
@@ -117,23 +125,32 @@ class TreadmillViewModel : ViewModel() {
                n.contains("fs-")
     }
 
+    // --- ПАКЕТОСТРОИТЕЛЬ ДЛЯ FA EF (hnk_sports) ---
+    // Формат: [0xFA] [0xEF] [CMD] [D1] [D2] [D3] [D4] [D5] [XOR_CHECKSUM]
+    fun buildFaEfPacket(cmd: Byte, d1: Byte = 0, d2: Byte = 0, d3: Byte = 0, d4: Byte = 0, d5: Byte = 0): ByteArray {
+        val cs = (cmd.toInt() xor d1.toInt() xor d2.toInt() xor d3.toInt() xor d4.toInt() xor d5.toInt()).toByte()
+        return byteArrayOf(
+            0xFA.toByte(),
+            0xEF.toByte(),
+            cmd,
+            d1, d2, d3, d4, d5,
+            cs
+        )
+    }
+
     // --- BLE СКАНЕР ---
     fun startScan(context: Context) {
         val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val adapter = btManager?.adapter
 
-        if (adapter == null) {
-            _state.value = _state.value.copy(statusText = "Bluetooth не поддерживается на устройстве")
-            return
-        }
-        if (!adapter.isEnabled) {
-            _state.value = _state.value.copy(statusText = "Bluetooth выключен! Пожалуйста, включите его.")
+        if (adapter == null || !adapter.isEnabled) {
+            _state.value = _state.value.copy(statusText = "Bluetooth выключен! Включите Bluetooth на телефоне.")
             return
         }
 
         bleScanner = adapter.bluetoothLeScanner
         if (bleScanner == null) {
-            _state.value = _state.value.copy(statusText = "Не удалось запустить BLE сканер. Проверьте Bluetooth.")
+            _state.value = _state.value.copy(statusText = "Не удалось запустить BLE сканер.")
             return
         }
 
@@ -148,9 +165,7 @@ class TreadmillViewModel : ViewModel() {
         scanCallback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 val dev = result.device ?: return
-                val devName = result.scanRecord?.deviceName 
-                    ?: dev.name 
-                    ?: "Unknown Device"
+                val devName = result.scanRecord?.deviceName ?: dev.name ?: "Unknown Device"
                 val address = dev.address ?: ""
                 val rssi = result.rssi
                 val isTarget = isTargetDevice(devName)
@@ -159,26 +174,15 @@ class TreadmillViewModel : ViewModel() {
 
                 val current = _state.value.discoveredDevices.toMutableList()
                 val idx = current.indexOfFirst { it.address == address }
-                val item = DiscoveredDevice(
-                    name = devName,
-                    address = address,
-                    rssi = rssi,
-                    isTarget = isTarget,
-                    device = dev
-                )
+                val item = DiscoveredDevice(devName, address, rssi, isTarget, dev)
 
                 if (idx >= 0) {
                     current[idx] = item
                 } else {
-                    if (isTarget) {
-                        current.add(0, item)
-                    } else {
-                        current.add(item)
-                    }
+                    if (isTarget) current.add(0, item) else current.add(item)
                 }
                 _state.value = _state.value.copy(discoveredDevices = current)
 
-                // Если найдена целевая дорожка (hnk_sports / unix) — подключаемся сразу!
                 if (isTarget && !_state.value.isConnected) {
                     Log.d("BLE_DUMP", "Auto-connecting to target: $devName ($address)")
                     stopScan()
@@ -191,22 +195,12 @@ class TreadmillViewModel : ViewModel() {
             }
 
             override fun onScanFailed(errorCode: Int) {
-                val err = when (errorCode) {
-                    SCAN_FAILED_ALREADY_STARTED -> "Сканирование уже запущено"
-                    SCAN_FAILED_APPLICATION_REGISTRATION_FAILED -> "Ошибка регистрации приложения"
-                    SCAN_FAILED_FEATURE_UNSUPPORTED -> "BLE сканирование не поддерживается"
-                    SCAN_FAILED_INTERNAL_ERROR -> "Внутренняя ошибка BLE стека"
-                    else -> "Ошибка сканирования: $errorCode"
-                }
-                Log.e("BLE_DUMP", "Scan failed: $err")
-                _state.value = _state.value.copy(statusText = err, isScanning = false)
+                _state.value = _state.value.copy(statusText = "Ошибка сканирования: $errorCode", isScanning = false)
             }
         }
 
         try {
-            val settings = ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                .build()
+            val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
             bleScanner?.startScan(null, settings, scanCallback)
 
             scanTimeoutJob = viewModelScope.launch {
@@ -215,12 +209,10 @@ class TreadmillViewModel : ViewModel() {
                     stopScan()
                     _state.value = _state.value.copy(
                         isScanning = false,
-                        statusText = if (_state.value.isConnected) _state.value.statusText else "Поиск завершен. Если hnk_sports в списке, нажмите «Подключить»."
+                        statusText = if (_state.value.isConnected) _state.value.statusText else "Поиск завершен. Выберите hnk_sports из списка."
                     )
                 }
             }
-        } catch (e: SecurityException) {
-            _state.value = _state.value.copy(statusText = "Нет разрешения на поиск Bluetooth", isScanning = false)
         } catch (e: Exception) {
             _state.value = _state.value.copy(statusText = "Ошибка: ${e.message}", isScanning = false)
         }
@@ -230,14 +222,10 @@ class TreadmillViewModel : ViewModel() {
         try {
             scanTimeoutJob?.cancel()
             scanTimeoutJob = null
-            scanCallback?.let { cb ->
-                bleScanner?.stopScan(cb)
-            }
+            scanCallback?.let { bleScanner?.stopScan(it) }
             scanCallback = null
             _state.value = _state.value.copy(isScanning = false)
-        } catch (e: Exception) {
-            Log.e("BLE_DUMP", "Error stopping scan", e)
-        }
+        } catch (_: Exception) {}
     }
 
     // --- ПОДКЛЮЧЕНИЕ К УСТРОЙСТВУ ---
@@ -257,22 +245,21 @@ class TreadmillViewModel : ViewModel() {
 
         val gattCallback = object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-                Log.d("BLE_DUMP", "onConnectionStateChange: status=$status, newState=$newState")
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    Log.d("BLE_DUMP", "Connected to GATT server! Discovering services...")
+                    Log.d("BLE_DUMP", "Connected to GATT! Discovering services...")
                     _state.value = _state.value.copy(isConnected = true, statusText = "Подключено к $devName. Поиск сервисов...")
                     gatt.discoverServices()
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    Log.d("BLE_DUMP", "Disconnected from GATT server. Status: $status")
+                    Log.d("BLE_DUMP", "Disconnected. Status: $status")
                     _state.value = _state.value.copy(
                         isConnected = false,
+                        isRunning = false,
                         statusText = "Отключено (Статус: $status). Нажмите Поиск для повтора."
                     )
                 }
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-                Log.d("BLE_DUMP", "onServicesDiscovered status=$status, count=${gatt.services.size}")
                 val dump = buildString {
                     gatt.services.forEach { s ->
                         appendLine("Service: ${s.uuid}")
@@ -284,10 +271,41 @@ class TreadmillViewModel : ViewModel() {
                 _state.value = _state.value.copy(servicesDump = dump)
                 Log.d("BLE_DUMP", "DUMP:\n$dump")
 
-                // 1. Проверяем стандартный FTMS (0x1826)
+                // Проверяем сервис 0xFFF0 (основной для hnk_sports)
+                val fff0 = gatt.getService(BleUuids.CUSTOM_SERVICE_FFF0)
+                val ffe0 = gatt.getService(BleUuids.CUSTOM_SERVICE_FFE0)
+                val custom = fff0 ?: ffe0
+
+                if (custom != null) {
+                    isFaEfProtocol = true
+                    val uuidShort = custom.uuid.toString().substring(4, 8).uppercase(Locale.ROOT)
+                    Log.d("BLE_DUMP", "Custom service found: 0x$uuidShort")
+
+                    val notifyChar = custom.characteristics.firstOrNull {
+                        (it.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
+                    }
+
+                    // Для записи: ищем FFF2 или характеристику с WRITE / WRITE_NO_RESPONSE
+                    val writeChar = custom.characteristics.firstOrNull {
+                        it.uuid.toString().contains("fff2", ignoreCase = true) ||
+                        it.uuid.toString().contains("ffe2", ignoreCase = true)
+                    } ?: custom.characteristics.firstOrNull {
+                        (it.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) != 0
+                    }
+
+                    controlChar = writeChar
+                    if (notifyChar != null) {
+                        enableNotification(gatt, notifyChar)
+                    }
+
+                    _state.value = _state.value.copy(statusText = "Готово (Протокол FA EF, сервис 0x$uuidShort)")
+                    return
+                }
+
+                // Проверяем стандартный FTMS (1826)
                 val ftms = gatt.getService(BleUuids.FTMS_SERVICE)
                 if (ftms != null) {
-                    Log.d("BLE_DUMP", "Bingo! FTMS 0x1826 found.")
+                    isFaEfProtocol = false
                     controlChar = ftms.getCharacteristic(BleUuids.CONTROL_POINT)
                     val dataChar = ftms.getCharacteristic(BleUuids.TREADMILL_DATA)
                     if (dataChar != null) {
@@ -297,42 +315,7 @@ class TreadmillViewModel : ViewModel() {
                     return
                 }
 
-                // 2. Проверяем китайские FitShow сервисы FFE0 или FFF0
-                val customFfe0 = gatt.getService(BleUuids.CUSTOM_SERVICE_FFE0)
-                val customFff0 = gatt.getService(BleUuids.CUSTOM_SERVICE_FFF0)
-                val custom = customFfe0 ?: customFff0
-
-                if (custom != null) {
-                    val uuidShort = custom.uuid.toString().substring(4, 8).uppercase(Locale.ROOT)
-                    Log.d("BLE_DUMP", "Custom FitShow/Chinese service found: 0x$uuidShort")
-                    val notifyChar = custom.characteristics.firstOrNull {
-                        (it.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
-                    }
-                    val writeChar = custom.characteristics.firstOrNull {
-                        (it.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) != 0
-                    }
-
-                    controlChar = writeChar
-                    if (notifyChar != null) {
-                        enableNotification(gatt, notifyChar)
-                    }
-                    _state.value = _state.value.copy(statusText = "Готово (Кастомный протокол 0x$uuidShort)")
-                    return
-                }
-
-                // 3. Если другой чип: подписываемся на первую подходящую характеристику
-                val anyNotify = gatt.services.flatMap { it.characteristics }.firstOrNull {
-                    (it.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
-                }
-                val anyWrite = gatt.services.flatMap { it.characteristics }.firstOrNull {
-                    (it.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) != 0
-                }
-
-                if (anyNotify != null) {
-                    enableNotification(gatt, anyNotify)
-                }
-                controlChar = anyWrite
-                _state.value = _state.value.copy(statusText = "Подключено к $devName (см. дамп сервисов)")
+                _state.value = _state.value.copy(statusText = "Подключено к $devName (см. дамп)")
             }
 
             override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
@@ -340,7 +323,8 @@ class TreadmillViewModel : ViewModel() {
                 val hex = bytes.joinToString(" ") { "%02X".format(it) }
                 Log.d("BLE_DUMP", "RX [${characteristic.uuid}]: $hex")
                 _state.value = _state.value.copy(rawBytesLog = hex)
-                parseFtmsTelemetry(bytes)
+
+                parseTelemetry(bytes)
             }
         }
 
@@ -350,8 +334,6 @@ class TreadmillViewModel : ViewModel() {
             } else {
                 device.connectGatt(context, false, gattCallback)
             }
-        } catch (e: SecurityException) {
-            _state.value = _state.value.copy(statusText = "Ошибка: нет разрешения BLUETOOTH_CONNECT")
         } catch (e: Exception) {
             _state.value = _state.value.copy(statusText = "Ошибка подключения: ${e.message}")
         }
@@ -366,82 +348,137 @@ class TreadmillViewModel : ViewModel() {
         }
     }
 
-    // --- ПАРСИНГ ТЕЛЕМЕТРИИ ---
-    private fun parseFtmsTelemetry(bytes: ByteArray) {
+    // --- ПАРСИНГ ТЕЛЕМЕТРИИ С ДОРОЖКИ ---
+    private fun parseTelemetry(bytes: ByteArray) {
         if (bytes.size < 4) return
-        val rawSpeed = ((bytes[3].toInt() and 0xFF) shl 8) or (bytes[2].toInt() and 0xFF)
-        val speedKmh = rawSpeed / 100.0f
 
-        val currentDist = _state.value.distanceMeters + (speedKmh / 3.6f).toInt()
-        val currentSec = _state.value.elapsedSeconds + 1
-        val currentCal = (currentDist * 0.065f).toInt()
-        val steps = (currentDist / 0.75f).toInt()
+        // 1. Протокол FA EF (hnk_sports: FA EF 91 00 00 00 00 00 91)
+        if (bytes.size >= 9 && bytes[0] == 0xFA.toByte() && bytes[1] == 0xEF.toByte()) {
+            val cmd = bytes[2].toInt() and 0xFF
+            if (cmd == 0x91 || cmd == 0x51 || cmd == 0x53) {
+                val statusByte = bytes[3].toInt() and 0xFF  // 0 = Стоп, 1 = Разгон/Старт, 2 = Бег, 3 = Пауза
+                val rawSpeed = bytes[4].toInt() and 0xFF    // Скорость в 0.1 км/ч (например, 15 = 1.5 км/ч)
+                val rawDist = (bytes[5].toInt() and 0xFF) or ((bytes[6].toInt() and 0xFF) shl 8)
+                val rawCal = bytes[7].toInt() and 0xFF
 
-        _state.value = _state.value.copy(
-            currentSpeedKmh = speedKmh,
-            distanceMeters = currentDist,
-            elapsedSeconds = currentSec,
-            caloriesKcal = currentCal,
-            estimatedSteps = steps
-        )
+                val isRunning = statusByte != 0
+                val speedKmh = if (isRunning && rawSpeed > 0) rawSpeed / 10.0f else 0.0f
+
+                val currentSec = if (isRunning) _state.value.elapsedSeconds + 1 else _state.value.elapsedSeconds
+                val currentDist = if (isRunning && rawDist > 0) rawDist else _state.value.distanceMeters + (speedKmh / 3.6f).toInt()
+                val currentCal = if (isRunning && rawCal > 0) rawCal else (currentDist * 0.065f).toInt()
+                val steps = (currentDist / 0.75f).toInt()
+
+                _state.value = _state.value.copy(
+                    isRunning = isRunning,
+                    currentSpeedKmh = speedKmh,
+                    elapsedSeconds = currentSec,
+                    distanceMeters = currentDist,
+                    caloriesKcal = currentCal,
+                    estimatedSteps = steps
+                )
+                return
+            }
+        }
+
+        // 2. Стандартный FTMS (если подключен FTMS)
+        if (!isFaEfProtocol) {
+            val rawSpeed = ((bytes[3].toInt() and 0xFF) shl 8) or (bytes[2].toInt() and 0xFF)
+            val speedKmh = rawSpeed / 100.0f
+            val currentDist = _state.value.distanceMeters + (speedKmh / 3.6f).toInt()
+            val currentSec = _state.value.elapsedSeconds + 1
+            val currentCal = (currentDist * 0.065f).toInt()
+            val steps = (currentDist / 0.75f).toInt()
+
+            _state.value = _state.value.copy(
+                currentSpeedKmh = speedKmh,
+                distanceMeters = currentDist,
+                elapsedSeconds = currentSec,
+                caloriesKcal = currentCal,
+                estimatedSteps = steps
+            )
+        }
     }
 
-    // --- КОМАНДЫ УПРАВЛЕНИЯ ДОРОЖКОЙ ---
-    private fun sendCommand(bytes: ByteArray) {
+    // --- ОТПРАВКА БАЙТОВ В ДОРОЖКУ ---
+    fun sendBytes(bytes: ByteArray) {
         val gatt = bluetoothGatt ?: return
         val char = controlChar ?: return
+
+        // Выставляем правильный тип записи для характеристики
+        if ((char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0) {
+            char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        } else {
+            char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        }
+
         char.value = bytes
         val hex = bytes.joinToString(" ") { "%02X".format(it) }
-        Log.d("BLE_DUMP", "TX [${char.uuid}]: $hex")
-        gatt.writeCharacteristic(char)
+        val ok = gatt.writeCharacteristic(char)
+        Log.d("BLE_DUMP", "TX [${char.uuid}] ok=$ok: $hex")
+        _state.value = _state.value.copy(txBytesLog = hex)
     }
 
-    fun requestControl() = sendCommand(byteArrayOf(0x00))
-
+    // --- УПРАВЛЕНИЕ: СТАРТ / СТОП / СКОРОСТЬ ---
     fun startBelt() {
         workoutStartTime = Instant.now()
-        val charUuid = controlChar?.uuid?.toString() ?: ""
-        if (charUuid.contains("2ad9", ignoreCase = true)) {
-            requestControl()
-            sendCommand(byteArrayOf(0x07))
+        if (isFaEfProtocol) {
+            // Для hnk_sports отправляем команду старта протокола FA EF
+            // CMD 0x01 — команда старта мотора
+            sendBytes(buildFaEfPacket(0x01.toByte(), 0x01, 0x00, 0x00, 0x00, 0x00))
+            // Альтернативная команда старта для некоторых китайских ревизий
+            sendBytes(buildFaEfPacket(0x01.toByte(), 0x00, 0x00, 0x00, 0x00, 0x00))
+            // Также отправляем команду начальной скорости 1.0 км/ч (0x0A)
+            sendBytes(buildFaEfPacket(0x03.toByte(), 10, 0x00, 0x00, 0x00, 0x00))
         } else {
-            // FitShow пакет старта + FTMS байт на случай совместимости
-            sendCommand(byteArrayOf(0x02, 0x53, 0x01, 0x01, 0x53, 0x03))
-            sendCommand(byteArrayOf(0x07))
+            // Чистый FTMS
+            sendBytes(byteArrayOf(0x00)) // Request control
+            sendBytes(byteArrayOf(0x07)) // Start
         }
+        _state.value = _state.value.copy(isRunning = true, currentSpeedKmh = max(1.0f, _state.value.currentSpeedKmh))
     }
 
     fun stopBelt() {
-        val charUuid = controlChar?.uuid?.toString() ?: ""
-        if (charUuid.contains("2ad9", ignoreCase = true)) {
-            sendCommand(byteArrayOf(0x08, 0x01))
+        if (isFaEfProtocol) {
+            // CMD 0x02 — остановка мотора
+            sendBytes(buildFaEfPacket(0x02.toByte(), 0x00, 0x00, 0x00, 0x00, 0x00))
+            sendBytes(buildFaEfPacket(0x02.toByte(), 0x01, 0x00, 0x00, 0x00, 0x00))
         } else {
-            sendCommand(byteArrayOf(0x02, 0x53, 0x01, 0x00, 0x52, 0x03))
-            sendCommand(byteArrayOf(0x08, 0x01))
+            sendBytes(byteArrayOf(0x08, 0x01))
         }
+        _state.value = _state.value.copy(isRunning = false, currentSpeedKmh = 0.0f)
     }
 
     fun changeSpeed(deltaKmh: Float) {
         val targetSpeed = min(12.0f, max(1.0f, _state.value.currentSpeedKmh + deltaKmh))
-        val rawSpeed = (targetSpeed * 100).toInt()
-        
-        val charUuid = controlChar?.uuid?.toString() ?: ""
-        if (charUuid.contains("2ad9", ignoreCase = true)) {
+        if (isFaEfProtocol) {
+            // CMD 0x03 — установка скорости (в десятых долях км/ч, например 1.5 -> 15)
+            val speedRaw = (targetSpeed * 10).toInt().toByte()
+            sendBytes(buildFaEfPacket(0x03.toByte(), speedRaw, 0x00, 0x00, 0x00, 0x00))
+        } else {
+            val rawSpeed = (targetSpeed * 100).toInt()
             val cmd = byteArrayOf(
                 0x02,
                 (rawSpeed and 0xFF).toByte(),
                 ((rawSpeed shr 8) and 0xFF).toByte()
             )
-            sendCommand(cmd)
-        } else {
-            // FitShow команда скорости
-            val speedInt = (targetSpeed * 10).toInt()
-            val checksum = (0x53 xor 0x02 xor (speedInt and 0xFF)).toByte()
-            sendCommand(byteArrayOf(0x02, 0x53, 0x02, (speedInt and 0xFF).toByte(), checksum, 0x03))
+            sendBytes(cmd)
         }
+        _state.value = _state.value.copy(currentSpeedKmh = targetSpeed)
     }
 
-    // --- ВЫГРУЗКА В HEALTH CONNECT / GOOGLE FIT ---
+    // --- ОБНОВЛЕНИЕ ПРИЛОЖЕНИЯ ИЗ GITHUB ---
+    fun checkAndInstallUpdate(context: Context) {
+        _state.value = _state.value.copy(isUpdating = true, updateStatus = "Проверка обновлений...")
+        AppUpdater.downloadAndInstall(
+            context = context,
+            onStatusChange = { msg -> _state.value = _state.value.copy(updateStatus = msg) },
+            onProgress = { p -> _state.value = _state.value.copy(updateProgress = p) },
+            onDone = { _state.value = _state.value.copy(isUpdating = false) }
+        )
+    }
+
+    // --- ВЫГРУЗКА В GOOGLE FIT ---
     fun syncToGoogleFit(context: Context) {
         viewModelScope.launch {
             try {
@@ -469,7 +506,7 @@ class TreadmillViewModel : ViewModel() {
                     )
                 )
                 client.insertRecords(records)
-                _state.value = _state.value.copy(statusText = "Тренировка сохранена в Health Connect / Google Fit!")
+                _state.value = _state.value.copy(statusText = "Тренировка сохранена в Google Fit!")
             } catch (e: Exception) {
                 _state.value = _state.value.copy(statusText = "Ошибка синхронизации: ${e.localizedMessage}")
             }
@@ -478,7 +515,101 @@ class TreadmillViewModel : ViewModel() {
 }
 
 // ==========================================
-// 3. UI (JETPACK COMPOSE) И РАЗРЕШЕНИЯ
+// 3. IN-APP ОБНОВЛЕНИЕ ИЗ GITHUB
+// ==========================================
+object AppUpdater {
+    fun downloadAndInstall(
+        context: Context,
+        onStatusChange: (String) -> Unit,
+        onProgress: (Float) -> Unit,
+        onDone: () -> Unit
+    ) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                onStatusChange("Запрос списка версий с GitHub...")
+                val apiUrl = URL("https://api.github.com/repos/Belorx/ReFit/releases")
+                val conn = apiUrl.openConnection() as HttpURLConnection
+                conn.setRequestProperty("Accept", "application/vnd.github.v3+json")
+                conn.connectTimeout = 10000
+                conn.readTimeout = 10000
+
+                if (conn.responseCode != 200) {
+                    onStatusChange("Ответ сервера: ${conn.responseCode}")
+                    onDone()
+                    return@launch
+                }
+
+                val jsonStr = conn.inputStream.bufferedReader().use { it.readText() }
+                // Ищем прямую ссылку на APK в релизах
+                val regex = """"browser_download_url":\s*"([^"]+\.apk)"""".toRegex()
+                val match = regex.find(jsonStr)
+                if (match == null) {
+                    onStatusChange("Новый APK не найден в релизах")
+                    onDone()
+                    return@launch
+                }
+
+                val apkUrlStr = match.groupValues[1]
+                val apkName = apkUrlStr.substringAfterLast("/")
+                onStatusChange("Скачивание $apkName...")
+
+                var redirectConn = URL(apkUrlStr).openConnection() as HttpURLConnection
+                redirectConn.instanceFollowRedirects = true
+                redirectConn.connectTimeout = 15000
+                redirectConn.readTimeout = 20000
+
+                var redirectCount = 0
+                while ((redirectConn.responseCode == 301 || redirectConn.responseCode == 302 || redirectConn.responseCode == 307) && redirectCount < 5) {
+                    val loc = redirectConn.getHeaderField("Location") ?: break
+                    redirectConn = URL(loc).openConnection() as HttpURLConnection
+                    redirectCount++
+                }
+
+                val totalLength = redirectConn.contentLength
+                val cacheDir = context.externalCacheDir ?: context.cacheDir
+                val apkFile = File(cacheDir, "refit-update.apk")
+                if (apkFile.exists()) apkFile.delete()
+
+                redirectConn.inputStream.use { input ->
+                    FileOutputStream(apkFile).use { output ->
+                        val buffer = ByteArray(8192)
+                        var bytesRead: Int
+                        var totalRead = 0L
+                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                            output.write(buffer, 0, bytesRead)
+                            totalRead += bytesRead
+                            if (totalLength > 0) {
+                                onProgress(totalRead.toFloat() / totalLength.toFloat())
+                            }
+                        }
+                    }
+                }
+
+                onStatusChange("Запуск установщика $apkName...")
+                withContext(Dispatchers.Main) {
+                    val uri = FileProvider.getUriForFile(
+                        context,
+                        "${context.packageName}.fileprovider",
+                        apkFile
+                    )
+                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(uri, "application/vnd.android.package-archive")
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(intent)
+                }
+            } catch (e: Exception) {
+                onStatusChange("Ошибка: ${e.localizedMessage}")
+            } finally {
+                onDone()
+            }
+        }
+    }
+}
+
+// ==========================================
+// 4. UI И КОМПОНЕНТЫ (JETPACK COMPOSE)
 // ==========================================
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -499,7 +630,6 @@ class MainActivity : ComponentActivity() {
 fun TreadmillScreen(vm: TreadmillViewModel, context: Context) {
     val state by vm.state.collectAsState()
 
-    // 1. Разрешения Bluetooth и геолокации
     val bluetoothPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         listOf(
             Manifest.permission.BLUETOOTH_SCAN,
@@ -530,102 +660,79 @@ fun TreadmillScreen(vm: TreadmillViewModel, context: Context) {
         }
     }
 
-    // 2. Health Connect launcher (отдельно от BLE разрешений)
     val healthConnectLauncher = rememberLauncherForActivityResult(
         PermissionController.createRequestPermissionResultContract()
     ) {
         vm.syncToGoogleFit(context)
     }
 
-    // Запрос Bluetooth-разрешений при первом запуске
     LaunchedEffect(Unit) {
         if (!hasBtPermissions) {
             permLauncher.launch(bluetoothPermissions.toTypedArray())
         }
     }
 
-    val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-    val isBtEnabled = btManager?.adapter?.isEnabled == true
-
     Column(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(20.dp),
+            .padding(18.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // Заголовок
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(text = "UNIX FIT R-280", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-            Text(text = "hnk_sports controller", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.secondary)
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = state.statusText,
-                color = MaterialTheme.colorScheme.primary,
-                style = MaterialTheme.typography.bodyMedium
-            )
-        }
+        // Шапка и плашка обновления
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+        ) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(text = "UNIX FIT R-280", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Text(text = "hnk_sports v1.1", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
+                    }
 
-        // Предупреждение если нет разрешений
-        if (!hasBtPermissions) {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Text(
-                        "⚠️ Требуются разрешения на Bluetooth и геолокацию",
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onErrorContainer
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        "Android требует разрешение на поиск BLE устройств поблизости.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onErrorContainer
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Button(onClick = { permLauncher.launch(bluetoothPermissions.toTypedArray()) }) {
-                        Text("Предоставить доступ")
+                    Button(
+                        onClick = { vm.checkAndInstallUpdate(context) },
+                        enabled = !state.isUpdating,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text(if (state.isUpdating) "Загрузка..." else "🔄 Обновить APK")
+                    }
+                }
+
+                if (state.updateStatus.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(text = state.updateStatus, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                    if (state.isUpdating && state.updateProgress > 0f) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        LinearProgressIndicator(
+                            progress = { state.updateProgress },
+                            modifier = Modifier.fillMaxWidth()
+                        )
                     }
                 }
             }
         }
 
-        // Предупреждение если Bluetooth выключен
-        if (!isBtEnabled) {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Text(
-                        "⚠️ Bluetooth отключен на телефоне",
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onErrorContainer
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Button(onClick = {
-                        try {
-                            context.startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
-                        } catch (_: Exception) {}
-                    }) {
-                        Text("Включить Bluetooth")
-                    }
-                }
-            }
-        }
+        // Статус подключения
+        Text(
+            text = state.statusText,
+            color = MaterialTheme.colorScheme.primary,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Medium
+        )
 
-        // Кнопка сканирования
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        // Кнопка поиска
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Button(
                 onClick = {
-                    if (!hasBtPermissions) {
-                        permLauncher.launch(bluetoothPermissions.toTypedArray())
-                    } else {
-                        vm.startScan(context)
-                    }
+                    if (!hasBtPermissions) permLauncher.launch(bluetoothPermissions.toTypedArray())
+                    else vm.startScan(context)
                 },
                 enabled = !state.isConnected && !state.isScanning
             ) {
@@ -641,68 +748,33 @@ fun TreadmillScreen(vm: TreadmillViewModel, context: Context) {
 
         // Список найденных устройств
         if (state.discoveredDevices.isNotEmpty() && !state.isConnected) {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Text(
-                        text = "Найдено устройств: ${state.discoveredDevices.size}",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text("Найдено устройств: ${state.discoveredDevices.size}", fontWeight = FontWeight.Bold)
+                    Spacer(modifier = Modifier.height(6.dp))
                     state.discoveredDevices.forEach { dev ->
                         Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 4.dp),
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(
-                                        text = dev.name,
-                                        fontWeight = if (dev.isTarget) FontWeight.Bold else FontWeight.Normal,
-                                        color = if (dev.isTarget) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-                                    )
-                                    if (dev.isTarget) {
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Surface(
-                                            color = MaterialTheme.colorScheme.primaryContainer,
-                                            shape = MaterialTheme.shapes.extraSmall
-                                        ) {
-                                            Text(
-                                                "Дорожка",
-                                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
-                                                style = MaterialTheme.typography.labelSmall
-                                            )
-                                        }
-                                    }
-                                }
-                                Text(
-                                    text = "${dev.address} | RSSI: ${dev.rssi} dBm",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
+                                Text(dev.name, fontWeight = if (dev.isTarget) FontWeight.Bold else FontWeight.Normal)
+                                Text("${dev.address} | RSSI: ${dev.rssi} dBm", style = MaterialTheme.typography.bodySmall)
                             }
-                            Button(
-                                onClick = { vm.connectToDevice(context, dev.device) },
-                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
-                            ) {
+                            Button(onClick = { vm.connectToDevice(context, dev.device) }) {
                                 Text("Подключить")
                             }
                         }
-                        HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                        HorizontalDivider()
                     }
                 }
             }
         }
 
-        // Дашборд тренировки
+        // Дашборд показателей
         Card(modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
                     text = "Скорость: ${"%.1f".format(state.currentSpeedKmh)} км/ч",
                     style = MaterialTheme.typography.headlineMedium,
@@ -720,9 +792,9 @@ fun TreadmillScreen(vm: TreadmillViewModel, context: Context) {
             }
         }
 
-        // Кнопки управления бегом
-        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+        // Главные кнопки управления
+        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
                 Button(
                     onClick = { vm.startBelt() },
                     enabled = state.isConnected,
@@ -740,7 +812,7 @@ fun TreadmillScreen(vm: TreadmillViewModel, context: Context) {
                 }
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
                 FilledTonalButton(
                     onClick = { vm.changeSpeed(-0.5f) },
                     enabled = state.isConnected,
@@ -772,58 +844,149 @@ fun TreadmillScreen(vm: TreadmillViewModel, context: Context) {
             }
         }
 
-        // Диагностический блок BLE (сырые байты и дамп сервисов)
-        if (state.rawBytesLog.isNotEmpty() || state.servicesDump.isNotEmpty()) {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Text(
-                        "📡 BLE ДИАГНОСТИКА (для Antigravity Flash)",
-                        fontWeight = FontWeight.Bold,
-                        style = MaterialTheme.typography.labelLarge
-                    )
+        // Блок BLE Тестирования и Диагностики для hnk_sports (FA EF)
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)
+        ) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    "📡 ДИАГНОСТИКА И ТЕСТ КОМАНД (FA EF)",
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.labelLarge
+                )
 
-                    if (state.rawBytesLog.isNotEmpty()) {
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = "Сырые байты (RX): ${state.rawBytesLog}",
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 12.sp
-                        )
+                if (state.rawBytesLog.isNotEmpty()) {
+                    Text(
+                        text = "Сырые байты (RX): ${state.rawBytesLog}",
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                if (state.txBytesLog.isNotEmpty()) {
+                    Text(
+                        text = "Отправлено (TX): ${state.txBytesLog}",
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.secondary
+                    )
+                }
+
+                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                Text("Быстрые тесты команд hnk_sports:", style = MaterialTheme.typography.labelSmall)
+
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Button(
+                        onClick = { vm.sendBytes(vm.buildFaEfPacket(0x01.toByte(), 0x01)) },
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("FA EF 01: Старт", fontSize = 11.sp)
                     }
 
-                    if (state.servicesDump.isNotEmpty()) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        var showDump by remember { mutableStateOf(false) }
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            TextButton(onClick = { showDump = !showDump }) {
-                                Text(if (showDump) "Скрыть дамп сервисов" else "Показать дамп сервисов")
-                            }
-                            IconButton(onClick = {
-                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                clipboard.setPrimaryClip(ClipData.newPlainText("BLE Dump", state.servicesDump))
-                                Toast.makeText(context, "Дамп сервисов скопирован!", Toast.LENGTH_SHORT).show()
-                            }) {
-                                Text("📋", fontSize = 16.sp)
-                            }
+                    Button(
+                        onClick = { vm.sendBytes(vm.buildFaEfPacket(0x02.toByte(), 0x00)) },
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("FA EF 02: Стоп", fontSize = 11.sp)
+                    }
+                }
+
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Button(
+                        onClick = { vm.sendBytes(vm.buildFaEfPacket(0x03.toByte(), 10)) },
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("FA EF 03: 1.0 км/ч", fontSize = 11.sp)
+                    }
+
+                    Button(
+                        onClick = { vm.sendBytes(vm.buildFaEfPacket(0x03.toByte(), 20)) },
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("FA EF 03: 2.0 км/ч", fontSize = 11.sp)
+                    }
+                }
+
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(
+                        onClick = { vm.sendBytes(vm.buildFaEfPacket(0x53.toByte(), 0x01, 0x01)) },
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("FA EF 53: S-Старт", fontSize = 11.sp)
+                    }
+
+                    OutlinedButton(
+                        onClick = { vm.sendBytes(vm.buildFaEfPacket(0x91.toByte())) },
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("FA EF 91: Опрос", fontSize = 11.sp)
+                    }
+                }
+
+                // Кастомный HEX ввод
+                var customHexInput by remember { mutableStateOf("FA EF 01 01 00 00 00 00 00") }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedTextField(
+                        value = customHexInput,
+                        onValueChange = { customHexInput = it },
+                        modifier = Modifier.weight(1f),
+                        label = { Text("Кастомный HEX", fontSize = 11.sp) },
+                        singleLine = true
+                    )
+                    Button(onClick = {
+                        try {
+                            val clean = customHexInput.replace(" ", "").replace("0x", "")
+                            val bytes = clean.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+                            vm.sendBytes(bytes)
+                        } catch (e: Exception) {
+                            Toast.makeText(context, "Ошибка HEX формата", Toast.LENGTH_SHORT).show()
                         }
-                        if (showDump) {
-                            Text(
-                                text = state.servicesDump,
-                                fontFamily = FontFamily.Monospace,
-                                fontSize = 11.sp,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.5f))
-                                    .padding(8.dp)
-                            )
+                    }) {
+                        Text("Шли")
+                    }
+                }
+
+                // Дамп сервисов
+                if (state.servicesDump.isNotEmpty()) {
+                    var showDump by remember { mutableStateOf(false) }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TextButton(onClick = { showDump = !showDump }) {
+                            Text(if (showDump) "Скрыть дамп сервисов" else "Показать дамп сервисов")
                         }
+                        IconButton(onClick = {
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(ClipData.newPlainText("BLE Dump", state.servicesDump))
+                            Toast.makeText(context, "Дамп скопирован!", Toast.LENGTH_SHORT).show()
+                        }) {
+                            Text("📋", fontSize = 16.sp)
+                        }
+                    }
+                    if (showDump) {
+                        Text(
+                            text = state.servicesDump,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.5f))
+                                .padding(8.dp)
+                        )
                     }
                 }
             }
