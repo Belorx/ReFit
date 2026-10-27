@@ -1,5 +1,15 @@
 # ReFit 🏃‍♂️💨
+[![Build Android APK](https://github.com/Belorx/ReFit/actions/workflows/build-apk.yml/badge.svg)](https://github.com/Belorx/ReFit/actions/workflows/build-apk.yml)
+
 > Простое и надежное Android-приложение на Kotlin + Jetpack Compose для управления беговой дорожкой **UNIX FIT R-280** по Bluetooth LE и синхронизации тренировок с **Health Connect** (Google Fit).
+
+---
+
+## 📲 Скачать готовый APK
+
+Готовый `.apk` автоматически собирается GitHub Actions при каждом коммите:
+* **[Последняя сборка (Releases)](https://github.com/Belorx/ReFit/releases)** — скачайте файл `ReFit-debug.apk` напрямую на телефон и установите.
+* Либо во вкладке **[Actions](https://github.com/Belorx/ReFit/actions)** выберите последний успешный запуск workflow и скачайте артефакт `ReFit-debug-apk`.
 
 ---
 
